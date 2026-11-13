@@ -1,0 +1,8 @@
+#!/bin/sh
+# Lock with the cyberpunk city still (written by cyberpunk-wallpaper), else plain colour
+IMG="${XDG_RUNTIME_DIR:-/tmp}/cyberpunk-lock.png"  # written by cyberpunk-wallpaper
+if [ -f "$IMG" ]; then
+    exec i3lock -i "$IMG" -c 0d0221 "$@"
+else
+    exec i3lock -c 0d0221 "$@"
+fi

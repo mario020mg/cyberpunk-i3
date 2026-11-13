@@ -1,0 +1,964 @@
+#!/usr/bin/env python3
+"""Animated cyberpunk city wallpaper for i3 / X11.
+
+Procedurally drawn with cairo into an override-redirect, click-through window
+kept at the bottom of the stack. Pauses itself when fully covered by windows.
+
+  cyberpunk-wallpaper            run as wallpaper
+  cyberpunk-wallpaper --fps 15   lower CPU use
+  cyberpunk-wallpaper --png f    render one frame to f and exit (preview)
+"""
+import argparse
+import math
+import random
+import signal
+import warnings
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_foreign("cairo")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+import cairo  # noqa: E402
+
+warnings.filterwarnings("ignore")
+
+NEON = [(1.0, 0.16, 0.62), (0.0, 0.92, 1.0), (0.72, 0.28, 1.0),
+        (1.0, 0.82, 0.22), (0.25, 1.0, 0.62)]
+WORDS = ["HOTEL", "RAMEN", "BAR", "OPEN", "24H", "NEON", "CYBER", "DATA",
+         "SUSHI", "ARCADE", "CLUB", "TECH", "NOIR"]
+TAU = 2 * math.pi
+
+
+def _hash(ix, iy, seed):
+    h = (ix * 374761393 + iy * 668265263 + seed * 2147483647) & 0xFFFFFFFF
+    h = ((h ^ (h >> 13)) * 1274126177) & 0xFFFFFFFF
+    return ((h ^ (h >> 16)) & 0xFFFF) / 65535.0
+
+
+def _vnoise(x, y, seed):
+    ix, iy = math.floor(x), math.floor(y)
+    fx, fy = x - ix, y - iy
+    fx, fy = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
+    a, b = _hash(ix, iy, seed), _hash(ix + 1, iy, seed)
+    c, d = _hash(ix, iy + 1, seed), _hash(ix + 1, iy + 1, seed)
+    return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy
+
+
+def _fbm(x, y, seed, octaves):
+    v, amp, tot = 0.0, 1.0, 0.0
+    for o in range(octaves):
+        v += _vnoise(x, y, seed + o * 17) * amp
+        tot += amp
+        x, y, amp = x * 2.03, y * 2.03, amp * .5
+    return v / tot
+
+
+def moon_texture(r):
+    """Full moon as a shaded sphere: irregular maria, soft craters, bright ray craters."""
+    size = 2 * r + 2
+    stride = cairo.ImageSurface.format_stride_for_width(cairo.FORMAT_ARGB32, size)
+    data = bytearray(stride * size)
+    rnd = random.Random(1969)
+    craters = [(rnd.uniform(-1.3, 1.3), rnd.uniform(-1.2, 1.2), rnd.uniform(.03, .11))
+               for _ in range(40)]
+    bright = [(-.15, .75, .07), (-.5, .2, .05)]  # Tycho / Copernicus-like
+    for py in range(size):
+        v = (py - r - .5) / r
+        for px in range(size):
+            u = (px - r - .5) / r
+            d2 = u * u + v * v
+            if d2 >= 1.03:
+                continue
+            dist = math.sqrt(d2)
+            z = math.sqrt(max(0.0, 1 - d2))
+            lon, lat = math.atan2(u, z), math.asin(max(-1, min(1, v)))
+            # maria: large irregular dark regions, more on the north-west like the real moon
+            m = _fbm(lon * 2.2 + 3.1, lat * 2.2 + 7.7, 5, 5) + .07 * (-lon) + .05 * (-lat)
+            mare = min(1, max(0, (m - .54) / .16))
+            mare = mare * mare * (3 - 2 * mare)
+            fine = _fbm(lon * 9, lat * 9, 11, 4) - .5
+            b = .95 - .30 * mare + .12 * fine
+            for cl, ct, cr_ in craters:
+                dd = math.hypot(lon - cl, lat - ct) / cr_
+                if dd < 1.25:
+                    if dd < 1:
+                        b -= .10 * (1 - dd) * (1 - .5 * mare)
+                    else:
+                        b += .07 * (1.25 - dd) / .25
+            for cl, ct, cr_ in bright:
+                dd = math.hypot(lon - cl, lat - ct)
+                ang = math.atan2(lat - ct, lon - cl)
+                b += .25 * math.exp(-(dd / cr_) ** 2)
+                b += .12 * math.exp(-dd / (cr_ * 6)) * max(0, math.sin(ang * 7 + 1.3)) ** 6
+            b *= .82 + .18 * z ** .5
+            b = max(0.0, min(1.0, b))
+            a = max(0.0, min(1.0, (1 - dist) * r + .5))
+            cr_r, cr_g, cr_b = b * .99, b * .98, b * .95
+            i = py * stride + px * 4
+            data[i] = int(cr_b * a * 255)
+            data[i + 1] = int(cr_g * a * 255)
+            data[i + 2] = int(cr_r * a * 255)
+            data[i + 3] = int(a * 255)
+    return cairo.ImageSurface.create_for_data(data, cairo.FORMAT_ARGB32, size, size, stride)
+
+
+class City:
+    def __init__(self, W, H, seed=None):
+        self.W, self.H = W, H
+        self.r = random.Random(seed)
+        self.flicker = {"back": [], "front": []}
+        self.antennas = {"back": [], "front": []}
+        self.near = []
+        self.signs = []
+        self.tower = None
+        self.holo = None
+        self.beams = [dict(x=W * f, ph=self.r.uniform(0, TAU), sp=self.r.uniform(.15, .3),
+                           col=self.r.choice(NEON)) for f in (.18, .63, .9)]
+        self.back = self.build_back()
+        self.front = self.build_front()
+        self.fog = self.build_fog()
+        self.overlay = self.build_overlay()
+        for k in self.flicker:
+            r = self.r
+            r.shuffle(self.flicker[k])
+            self.flicker[k] = self.flicker[k][:120]
+        self.cars = [self.new_car(True) for _ in range(6)]
+        self.drops = [self.new_drop(True) for _ in range(int(W * H / 4500))]
+        self.buf = cairo.ImageSurface(cairo.FORMAT_RGB24, W, H)
+        self.t = 0.0
+        self.next_glitch = self.r.uniform(5, 10)
+        self.glitch_until = 0.0
+        self.next_bolt = self.r.uniform(15, 35)
+        self.bolt = None
+
+    # ---------- static layers ----------
+    def build_back(self):
+        W, H, r = self.W, self.H, self.r
+        s = cairo.ImageSurface(cairo.FORMAT_RGB24, W, H)
+        cr = cairo.Context(s)
+        g = cairo.LinearGradient(0, 0, 0, H)
+        g.add_color_stop_rgb(0, .015, .01, .045)
+        g.add_color_stop_rgb(.45, .06, .02, .13)
+        g.add_color_stop_rgb(.75, .28, .05, .28)
+        g.add_color_stop_rgb(1, .10, .02, .10)
+        cr.set_source(g)
+        cr.paint()
+        for _ in range(80):
+            cr.set_source_rgba(.85, .85, 1, r.uniform(.1, .45))
+            cr.rectangle(int(r.uniform(0, W)), int(r.uniform(0, H * .45)), 1, 1)
+            cr.fill()
+        self.draw_moon(cr, W * .78, H * .18, H * .085)
+        # horizon light pollution
+        hg = cairo.RadialGradient(W * .5, H, 0, W * .5, H, W * .8)
+        hg.add_color_stop_rgba(0, 1, .2, .6, .35)
+        hg.add_color_stop_rgba(1, 1, .2, .6, 0)
+        cr.set_source(hg)
+        cr.paint()
+        # far skyline
+        self.layer(cr, .32, .64, 22, 60, (.11, .045, .18), [(.3, .9, 1)], .09, .35, (5, 7),
+                   tag=None, gap=(0, 4))
+        self.haze(cr, .55, (.9, .25, .65), .28)
+        self.build_tower(cr)
+        # mid skyline
+        self.layer(cr, .22, .52, 35, 95, (.06, .025, .10),
+                   [(1, .3, .7), (.3, .9, 1), (1, .8, .45)], .15, .6, (6, 9), tag="back",
+                   gap=(0, 10))
+        self.haze(cr, .7, (.7, .15, .6), .22)
+        return s
+
+    def draw_moon(self, cr, mx, my, mr):
+        # soft halo
+        for rad, a in ((mr * 5, .09), (mr * 2, .14)):
+            g = cairo.RadialGradient(mx, my, mr * .95, mx, my, rad)
+            g.add_color_stop_rgba(0, .85, .9, 1, a)
+            g.add_color_stop_rgba(1, .85, .9, 1, 0)
+            cr.set_source(g)
+            cr.paint()
+        tex = moon_texture(int(mr))
+        cr.set_source_surface(tex, mx - tex.get_width() / 2, my - tex.get_height() / 2)
+        cr.paint()
+
+    def build_tower(self, cr):
+        """Original corporate megatower: dark monolith, stepped crown, red edge lights."""
+        W, H, r = self.W, self.H, self.r
+        RED = (1.0, .1, .12)
+        cx, tw = W * .42, max(130, W * .125)
+        top, crown_b, spire = H * .12, H * .27, H * .04
+        # red aura behind the crown
+        g = cairo.RadialGradient(cx, H * .2, 0, cx, H * .2, tw * 1.6)
+        g.add_color_stop_rgba(0, *RED, .22)
+        g.add_color_stop_rgba(1, *RED, 0)
+        cr.set_source(g)
+        cr.paint()
+        # flanking wings
+        for sgn in (-1, 1):
+            wx = cx + sgn * (tw / 2 + tw * .11)
+            cr.set_source_rgb(.035, .025, .055)
+            cr.rectangle(wx - tw * .11, H * .40, tw * .22, H)
+            cr.fill()
+        # main shaft, two faces for depth, slight taper
+        bw, uw = tw, tw * .86
+        for face, col in ((-1, (.07, .05, .10)), (1, (.03, .022, .05))):
+            cr.set_source_rgb(*col)
+            cr.move_to(cx, crown_b)
+            cr.line_to(cx + face * uw / 2, crown_b)
+            cr.line_to(cx + face * bw / 2, H)
+            cr.line_to(cx, H)
+            cr.close_path()
+            cr.fill()
+        # stepped crown + chamfered top + spire
+        steps = [(uw * .78, crown_b - H * .04), (uw * .6, crown_b - H * .08), (uw * .44, top)]
+        prev_y = crown_b
+        for w, y in steps:
+            cr.set_source_rgb(.05, .035, .075)
+            cr.rectangle(cx - w / 2, y, w, prev_y - y)
+            cr.fill()
+            cr.set_source_rgba(*RED, .5)
+            cr.set_line_width(1)
+            cr.move_to(cx - w / 2, y + .5)
+            cr.line_to(cx + w / 2, y + .5)
+            cr.stroke()
+            prev_y = y
+        cw = uw * .44
+        cr.set_source_rgb(.05, .035, .075)
+        cr.move_to(cx - cw / 2, top)
+        cr.line_to(cx - cw * .2, top - H * .035)
+        cr.line_to(cx + cw * .2, top - H * .035)
+        cr.line_to(cx + cw / 2, top)
+        cr.close_path()
+        cr.fill()
+        cr.set_line_width(2)
+        cr.move_to(cx, top - H * .035)
+        cr.line_to(cx, spire)
+        cr.stroke()
+        self.antennas["back"].append((cx, spire, 0.0, 2.0))
+        self.antennas["back"].append((cx - cw / 2 + 2, top, 1.5, 2.6))
+        self.antennas["back"].append((cx + cw / 2 - 2, top, 3.0, 2.6))
+        # floor lines and sparse lit offices
+        for y in range(int(crown_b) + 6, H, 5):
+            t = (y - crown_b) / (H - crown_b)
+            half = (uw + (bw - uw) * t) / 2
+            cr.set_source_rgba(.6, .7, 1, .05)
+            cr.rectangle(cx - half + 3, y, 2 * half - 6, 1)
+            cr.fill()
+            for _ in range(2):
+                if r.random() < .5:
+                    wx = r.uniform(cx - half + 5, cx + half - 9)
+                    cr.set_source_rgba(1, .92, .8, r.uniform(.25, .6))
+                    cr.rectangle(wx, y, r.uniform(2, 6), 2)
+                    cr.fill()
+        # red light strips down the corners and the centre ridge
+        for x0, x1 in ((cx - uw / 2 + 2, cx - bw / 2 + 2), (cx + uw / 2 - 2, cx + bw / 2 - 2), (cx, cx)):
+            for lw, a in ((7, .06), (4, .12), (1.6, .7)):
+                cr.set_source_rgba(*RED, a if x0 != cx else a * .5)
+                cr.set_line_width(lw)
+                cr.move_to(x0, crown_b)
+                cr.line_to(x1, H)
+                cr.stroke()
+        # emblem on the crown (pulses, drawn per frame)
+        er = cw * .4
+        ey = top + (crown_b - top) * .35
+        self.tower = dict(x=cx, y=ey, r=er, surf=self.emblem(er, RED))
+        self.tower_span = (cx - tw * .75, cx + tw * .75)
+
+    def emblem(self, er, col):
+        pad = er * 1.6
+        size = int(2 * (er + pad))
+        s = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+        cr = cairo.Context(s)
+        c = size / 2
+
+        def path():
+            cr.new_path()
+            # split diamond with a horizontal bar: an original mark
+            cr.move_to(c, c - er)
+            cr.line_to(c + er * .8, c)
+            cr.line_to(c, c + er)
+            cr.line_to(c - er * .8, c)
+            cr.close_path()
+            cr.move_to(c - er * 1.15, c)
+            cr.line_to(c + er * 1.15, c)
+            cr.move_to(c, c - er * .45)
+            cr.line_to(c, c + er * .45)
+
+        for lw, a in ((er * .9, .05), (er * .5, .1), (er * .25, .25), (er * .1, .9)):
+            path()
+            cr.set_source_rgba(*col, a)
+            cr.set_line_width(max(1, lw))
+            cr.stroke()
+        path()
+        cr.set_source_rgba(1, .75, .75, .9)
+        cr.set_line_width(max(.8, er * .04))
+        cr.stroke()
+        return s
+
+    def draw_tower_glow(self, cr):
+        tw = self.tower
+        if not tw:
+            return
+        a = .7 + .3 * math.sin(self.t * 1.1)
+        w = tw["surf"].get_width()
+        cr.set_source_surface(tw["surf"], tw["x"] - w / 2, tw["y"] - w / 2)
+        cr.paint_with_alpha(a)
+
+    def build_front(self):
+        W, H = self.W, self.H
+        s = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
+        cr = cairo.Context(s)
+        self.layer(cr, .14, .82, 60, 150, (.022, .014, .038),
+                   [(1, .3, .7), (.3, .9, 1), (1, .85, .5), (.8, .5, 1)], .11, .8, (7, 10),
+                   tag="front", gap=(20, 140), near=True)
+        self.make_billboard()
+        self.make_signs(cr)
+        return s
+
+    def haze(self, cr, top, col, a):
+        g = cairo.LinearGradient(0, self.H * top, 0, self.H)
+        g.add_color_stop_rgba(0, *col, 0)
+        g.add_color_stop_rgba(.6, *col, a)
+        g.add_color_stop_rgba(1, *col, a * .4)
+        cr.set_source(g)
+        cr.rectangle(0, self.H * top, self.W, self.H)
+        cr.fill()
+
+    def layer(self, cr, hmin, hmax, wmin, wmax, col, wincols, dens, wa, cell, tag,
+              gap=(0, 6), near=False):
+        W, H, r = self.W, self.H, self.r
+        x = -r.uniform(0, wmax)
+        while x < W:
+            w = r.uniform(wmin, wmax)
+            h = H * r.uniform(hmin, hmax)
+            span = getattr(self, "tower_span", None)
+            if near and span and x < span[1] and x + w > span[0]:
+                h = min(h, H * r.uniform(.22, .4))  # keep the megatower visible
+            top = H - h
+            cr.set_source_rgb(*col)
+            cr.rectangle(x, top, w, h)
+            cr.fill()
+            roof = top
+            if r.random() < .35:
+                sw, sh = w * r.uniform(.3, .6), r.uniform(6, 22)
+                cr.rectangle(x + (w - sw) / 2, top - sh, sw, sh)
+                cr.fill()
+                roof = top - sh
+            if tag and r.random() < (.6 if near else .35):
+                ax, ah = x + w * r.uniform(.3, .7), r.uniform(15, 45)
+                cr.set_line_width(1.5)
+                cr.move_to(ax, roof)
+                cr.line_to(ax, roof - ah)
+                cr.stroke()
+                self.antennas[tag].append((ax, roof - ah, r.uniform(0, TAU), r.uniform(1.5, 3)))
+            cw, ch = cell
+            ww, wh = max(2, cw - 3), max(2, ch - 4)
+            cols, rows = int((w - 6) // cw), int((h - 8) // ch)
+            ox = x + (w - cols * cw) / 2 + 1
+            for j in range(rows):
+                for i in range(cols):
+                    wx, wy = ox + i * cw, top + 6 + j * ch
+                    lit = r.random() < dens
+                    c, a = r.choice(wincols), wa * r.uniform(.5, 1)
+                    if lit:
+                        cr.set_source_rgba(*c, a)
+                        cr.rectangle(wx, wy, ww, wh)
+                        cr.fill()
+                    if tag and r.random() < .05:
+                        self.flicker[tag].append([wx, wy, ww, wh, col, c, a, lit])
+            if near:
+                c = r.choice(NEON)
+                cr.set_source_rgba(*c, .4)
+                cr.set_line_width(1)
+                cr.move_to(x + w - .5, top)
+                cr.line_to(x + w - .5, H)
+                cr.stroke()
+                self.near.append((x, top, w, h))
+            x += w + r.uniform(*gap)
+
+    def neon_sign(self, word, col, vertical, size, on):
+        pad = 14
+        tmp = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1))
+        tmp.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        tmp.set_font_size(size)
+        if vertical:
+            bw, bh = size * 1.6, len(word) * size * 1.2 + size * .7
+        else:
+            bw, bh = tmp.text_extents(word).x_advance + size * 1.1, size * 1.8
+        sw, sh = int(bw + 2 * pad) + 1, int(bh + 2 * pad) + 1
+        s = cairo.ImageSurface(cairo.FORMAT_ARGB32, sw, sh)
+        cr = cairo.Context(s)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        cr.set_font_size(size)
+
+        def text():
+            cr.new_path()
+            if vertical:
+                for k, ch in enumerate(word):
+                    e = cr.text_extents(ch)
+                    cr.move_to(pad + bw / 2 - e.x_advance / 2,
+                               pad + size * .35 + (k + 1) * size * 1.2 - size * .2)
+                    cr.text_path(ch)
+            else:
+                e = cr.text_extents(word)
+                cr.move_to(pad + (bw - e.x_advance) / 2, pad + bh / 2 + size * .36)
+                cr.text_path(word)
+
+        def box():
+            cr.new_path()
+            cr.rectangle(pad + 3, pad + 3, bw - 6, bh - 6)
+
+        if not on:
+            cr.set_source_rgba(.02, .01, .03, .9)
+            cr.rectangle(pad, pad, bw, bh)
+            cr.fill()
+            for p in (box, text):
+                p()
+                cr.set_source_rgba(*col, .16)
+                cr.set_line_width(1.2)
+                cr.stroke()
+            return s, pad
+        core = tuple(min(1, c * .45 + .6) for c in col)
+        for p in (box, text):
+            for lw, a in ((12, .05), (8, .09), (5, .16), (2.6, .45)):
+                p()
+                cr.set_source_rgba(*col, a)
+                cr.set_line_width(lw)
+                cr.stroke()
+        text()
+        cr.set_source_rgba(*core, .95)
+        cr.fill()
+        box()
+        cr.set_source_rgba(*core, .9)
+        cr.set_line_width(1.1)
+        cr.stroke()
+        return s, pad
+
+    def make_signs(self, cr):
+        r, H = self.r, self.H
+        cands = [b for b in self.near if b[2] >= 50 and b[3] > H * .3]
+        r.shuffle(cands)
+        placed = [self.holo['rect']] if self.holo else []
+        for (bx, top, w, h) in cands:
+            if len(self.signs) >= 8:
+                break
+            vertical = r.random() < .55
+            word = r.choice([wd for wd in WORDS if (len(wd) <= 5 if vertical else len(wd) <= 6)])
+            col = r.choice(NEON)
+            size = r.uniform(16, 24)
+            off, pad = self.neon_sign(word, col, vertical, size, False)
+            on, _ = self.neon_sign(word, col, vertical, size, True)
+            sw, sh = off.get_width() - 2 * pad, off.get_height() - 2 * pad
+            x = bx + r.uniform(-sw * .3, max(0, w - sw * .7))
+            y = top + r.uniform(.04, .35) * h
+            rect = (x - 6, y - 6, x + sw + 6, y + sh + 6)
+            if any(not (rect[2] < p[0] or rect[0] > p[2] or rect[3] < p[1] or rect[1] > p[3])
+                   for p in placed):
+                continue
+            placed.append(rect)
+            cr.set_source_surface(off, x - pad, y - pad)
+            cr.paint()
+            self.signs.append(dict(surf=on, x=x - pad, y=y - pad, ph=r.uniform(0, 10),
+                                   mode=r.choice((0, 0, 1, 2)), per=r.uniform(3, 9)))
+
+    def build_fog(self):
+        W, H, r = self.W, self.H, self.r
+        fh = int(H * .4)
+        s = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, fh)
+        cr = cairo.Context(s)
+        for _ in range(26):
+            bx, by = r.uniform(0, W), r.uniform(fh * .3, fh * .9)
+            rad = r.uniform(80, 220)
+            col = r.choice(((.6, .2, .8), (.9, .25, .6), (.3, .5, .9)))
+            for ox in (-W, 0, W):
+                g = cairo.RadialGradient(bx + ox, by, 0, bx + ox, by, rad)
+                g.add_color_stop_rgba(0, *col, .07)
+                g.add_color_stop_rgba(1, *col, 0)
+                cr.set_source(g)
+                cr.paint()
+        return s
+
+    def build_overlay(self):
+        W, H = self.W, self.H
+        s = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
+        cr = cairo.Context(s)
+        cr.set_source_rgba(0, 0, 0, .13)
+        for y in range(0, H, 3):
+            cr.rectangle(0, y, W, 1)
+        cr.fill()
+        v = cairo.RadialGradient(W / 2, H / 2, min(W, H) * .45, W / 2, H / 2, max(W, H) * .78)
+        v.add_color_stop_rgba(0, 0, 0, 0, 0)
+        v.add_color_stop_rgba(1, 0, 0, 0, .55)
+        cr.set_source(v)
+        cr.paint()
+        return s
+
+    # ---------- moving things ----------
+    def new_car(self, init=False):
+        r, W, H = self.r, self.W, self.H
+        depth = r.uniform(.3, 1.0)
+        d = r.choice((-1, 1))
+        return dict(x=r.uniform(0, W) if init else (-60 if d > 0 else W + 60),
+                    y=H * r.uniform(.12, .62), v=d * r.uniform(50, 150) * depth,
+                    depth=depth, col=r.choice(NEON), bob=r.uniform(0, TAU))
+
+    def new_drop(self, init=False):
+        r = self.r
+        ln = r.uniform(8, 24)
+        return [r.uniform(-self.H * .2, self.W), r.uniform(-ln, self.H) if init else -ln,
+                ln, r.uniform(550, 950)]
+
+    def step(self, dt):
+        self.t += dt
+        W, H, r = self.W, self.H, self.r
+        for i, c in enumerate(self.cars):
+            c["x"] += c["v"] * dt
+            if c["x"] < -80 or c["x"] > W + 80:
+                self.cars[i] = self.new_car()
+        for i, d in enumerate(self.drops):
+            d[1] += d[3] * dt
+            d[0] += d[3] * .18 * dt
+            if d[1] - d[2] > H:
+                self.drops[i] = self.new_drop()
+        if self.t > self.next_bolt:
+            self.bolt = self.make_bolt()
+            self.next_bolt = self.t + r.uniform(40, 110)
+        if self.bolt and self.t - self.bolt["t0"] > 1.6:
+            self.bolt = None
+        for lst in self.flicker.values():
+            for f in lst:
+                if r.random() < .5 * dt:
+                    f[7] = not f[7]
+
+    # ---------- drawing ----------
+    def draw_flicker(self, cr, tag):
+        for wx, wy, ww, wh, bcol, c, a, lit in self.flicker[tag]:
+            if lit:
+                cr.set_source_rgba(*c, a)
+            else:
+                cr.set_source_rgb(*bcol)
+            cr.rectangle(wx, wy, ww, wh)
+            cr.fill()
+
+    def draw_antennas(self, cr, tag):
+        t = self.t
+        for ax, ay, ph, per in self.antennas[tag]:
+            a = max(0.0, math.sin(t * TAU / per + ph)) ** 4
+            if a < .02:
+                continue
+            g = cairo.RadialGradient(ax, ay, 0, ax, ay, 7)
+            g.add_color_stop_rgba(0, 1, .15, .2, .6 * a)
+            g.add_color_stop_rgba(1, 1, .15, .2, 0)
+            cr.set_source(g)
+            cr.arc(ax, ay, 7, 0, TAU)
+            cr.fill()
+            cr.set_source_rgba(1, .6, .6, a)
+            cr.arc(ax, ay, 1.4, 0, TAU)
+            cr.fill()
+
+    def draw_beams(self, cr):
+        H = self.H
+        for b in self.beams:
+            ang = -math.pi / 2 + math.sin(self.t * b["sp"] + b["ph"]) * .55
+            L, spread = H * 1.3, .06
+            x0, y0 = b["x"], H
+            p1 = (x0 + math.cos(ang - spread) * L, y0 + math.sin(ang - spread) * L)
+            p2 = (x0 + math.cos(ang + spread) * L, y0 + math.sin(ang + spread) * L)
+            g = cairo.LinearGradient(x0, y0, (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+            g.add_color_stop_rgba(0, *b["col"], .16)
+            g.add_color_stop_rgba(1, *b["col"], 0)
+            cr.set_source(g)
+            cr.move_to(x0, y0)
+            cr.line_to(*p1)
+            cr.line_to(*p2)
+            cr.close_path()
+            cr.fill()
+
+    def draw_cars(self, cr, front):
+        for c in self.cars:
+            if (c["depth"] > .75) != front:
+                continue
+            s = 1.5 + 3 * c["depth"]
+            x, y = c["x"], c["y"] + math.sin(self.t * 1.3 + c["bob"]) * 2
+            d = 1 if c["v"] > 0 else -1
+            tl = -c["v"] * .6
+            g = cairo.LinearGradient(x, y, x + tl, y)
+            g.add_color_stop_rgba(0, *c["col"], .6)
+            g.add_color_stop_rgba(1, *c["col"], 0)
+            cr.set_source(g)
+            cr.set_line_width(max(1, s * .6))
+            cr.move_to(x, y)
+            cr.line_to(x + tl, y)
+            cr.stroke()
+            cr.set_source_rgb(.04, .03, .07)
+            cr.rectangle(x - s * 1.6, y - s * .55, s * 3.2, s * 1.1)
+            cr.fill()
+            hx = x + d * s * 1.6
+            g = cairo.RadialGradient(hx, y, 0, hx, y, s * 1.8)
+            g.add_color_stop_rgba(0, 1, .97, .85, .85)
+            g.add_color_stop_rgba(1, 1, 1, .9, 0)
+            cr.set_source(g)
+            cr.arc(hx, y, s * 1.8, 0, TAU)
+            cr.fill()
+            cr.set_source_rgba(1, .2, .3, .9)
+            cr.rectangle(x - d * s * 1.6 - .5, y - .5, 1.5, 1.5)
+            cr.fill()
+
+    # ---------- lightning ----------
+    def make_bolt(self):
+        r, W, H = self.r, self.W, self.H
+
+        def zig(x, y, y_end, jit):
+            pts = [(x, y)]
+            while y < y_end:
+                y += r.uniform(7, 18)
+                x += r.uniform(-jit, jit)
+                pts.append((x, y))
+            return pts
+        main = zig(r.uniform(W * .05, W * .95), 0, H * r.uniform(.3, .5), 11)
+        branches = []
+        for _ in range(r.randint(1, 3)):
+            bx, by = main[r.randint(2, len(main) - 3)]
+            branches.append(zig(bx, by, by + H * r.uniform(.06, .15), 9))
+        return dict(t0=self.t, main=main, branches=branches)
+
+    def flash(self):
+        if not self.bolt:
+            return 0.0
+        d = self.t - self.bolt["t0"]
+        f = sum(a * math.exp(-((d - p) / .045) ** 2) for p, a in ((0, 1), (.14, .55), (.33, .85)))
+        return min(1.0, f + .12 * math.exp(-d / .5))
+
+    def draw_bolt(self, cr, f):
+        cr.set_source_rgba(.72, .78, 1, .33 * f)
+        cr.paint()
+        cr.set_line_join(cairo.LINE_JOIN_ROUND)
+        for pts, scale in [(self.bolt["main"], 1.0)] + [(b, .55) for b in self.bolt["branches"]]:
+            for lw, a, col in ((9, .08, (.6, .7, 1)), (4, .25, (.7, .8, 1)), (1.6, 1, (1, 1, 1))):
+                cr.new_path()
+                cr.move_to(*pts[0])
+                for p in pts[1:]:
+                    cr.line_to(*p)
+                cr.set_source_rgba(*col, a * f * scale)
+                cr.set_line_width(lw * scale)
+                cr.stroke()
+
+    # ---------- holographic billboard ----------
+    ADS = [("NEURAL LINK", "think faster", (0.0, .92, 1.0), "cube"),
+           ("SYNTH NOODLES", "now 30% real", (1.0, .16, .62), "ring"),
+           ("ORBITAL HOMES", "leave the rain", (.72, .28, 1.0), "pyramid")]
+
+    def make_billboard(self):
+        span = getattr(self, "tower_span", (0, 0))
+        cands = [b for b in self.near if b[2] >= 85 and b[1] < self.H * .55
+                 and (b[0] + b[2] < span[0] - 20 or b[0] > span[1] + 20)]
+        if not cands:
+            return
+        bx, top, w, h = self.r.choice(cands)
+        bw = min(w + 60, 200)
+        bh = bw * .5
+        x, y = bx + (w - bw) / 2, top + h * .1
+        self.holo = dict(x=x, y=y, w=bw, h=bh, rect=(x - 8, y - 8, x + bw + 8, y + bh + 30))
+
+    def draw_shape(self, cr, kind, cx, cy, size, t):
+        if kind == "ring":
+            for k in range(3):
+                sx = abs(math.cos(t * 1.2 + k * 1.05))
+                cr.save()
+                cr.translate(cx, cy)
+                cr.scale(max(.05, sx), 1)
+                cr.arc(0, 0, size, 0, TAU)
+                cr.restore()
+                cr.stroke()
+            return
+        if kind == "cube":
+            verts = [(x, y, z) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+            edges = [(a, b) for a in range(8) for b in range(a + 1, 8)
+                     if sum(va != vb for va, vb in zip(verts[a], verts[b])) == 1]
+        else:
+            verts = [(-1, 1, -1), (1, 1, -1), (1, 1, 1), (-1, 1, 1), (0, -1.2, 0)]
+            edges = [(0, 1), (1, 2), (2, 3), (3, 0), (0, 4), (1, 4), (2, 4), (3, 4)]
+        a, b = t * .9, .45
+        pts = []
+        for x, y, z in verts:
+            x, z = x * math.cos(a) - z * math.sin(a), x * math.sin(a) + z * math.cos(a)
+            y, z = y * math.cos(b) - z * math.sin(b), y * math.sin(b) + z * math.cos(b)
+            k = size * .62 * (3 / (3 + z))
+            pts.append((cx + x * k, cy + y * k))
+        for i, j in edges:
+            cr.move_to(*pts[i])
+            cr.line_to(*pts[j])
+        cr.stroke()
+
+    def draw_holo(self, cr):
+        b = self.holo
+        if not b:
+            return
+        t, r = self.t, self.r
+        x, y, w, h = b["x"], b["y"], b["w"], b["h"]
+        idx = int(t / 6) % len(self.ADS)
+        title, sub, col, shape = self.ADS[idx]
+        alpha = .82 + .12 * math.sin(t * 11)
+        switching = (t % 6) < .3
+        if switching or (t % 8.3) < .12:
+            alpha *= r.uniform(.2, 1)
+        cr.push_group()
+        if switching:
+            cr.translate(r.uniform(-6, 6), 0)
+        # projector cone from the ledge below
+        g = cairo.LinearGradient(0, y + h + 22, 0, y + h)
+        g.add_color_stop_rgba(0, *col, .25)
+        g.add_color_stop_rgba(1, *col, 0)
+        cr.set_source(g)
+        cr.move_to(x + w / 2 - 3, y + h + 22)
+        cr.line_to(x + w / 2 + 3, y + h + 22)
+        cr.line_to(x + w, y + h)
+        cr.line_to(x, y + h)
+        cr.close_path()
+        cr.fill()
+        # panel
+        cr.set_source_rgba(*col, .12)
+        cr.rectangle(x, y, w, h)
+        cr.fill()
+        cr.set_source_rgba(*col, .09)
+        for yy in range(int(y), int(y + h), 3):
+            cr.rectangle(x, yy, w, 1)
+        cr.fill()
+        sy = y + (t * 28) % h
+        cr.set_source_rgba(*col, .18)
+        cr.rectangle(x, sy, w, 2)
+        cr.fill()
+        for lw, a in ((5, .15), (1.2, .85)):
+            cr.set_source_rgba(*col, a)
+            cr.set_line_width(lw)
+            cr.rectangle(x + .5, y + .5, w - 1, h - 1)
+            cr.stroke()
+        # rotating wireframe
+        cr.set_line_width(1.2)
+        cr.set_source_rgba(*(min(1, c * .5 + .5) for c in col), .9)
+        self.draw_shape(cr, shape, x + h * .45, y + h * .5, h * .3, t)
+        # text
+        tx = x + h * .9
+        avail = w - h * .9 - 6
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        fs = h * .24
+        cr.set_font_size(fs)
+        ext = cr.text_extents(title)
+        if ext.x_advance > avail:
+            fs *= avail / ext.x_advance
+            cr.set_font_size(fs)
+        words = title.split(" ")
+        for k, wd in enumerate(words):
+            cr.move_to(tx, y + h * .32 + k * fs * 1.15)
+            cr.set_source_rgba(*(min(1, c * .4 + .6) for c in col), .95)
+            cr.show_text(wd)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_ITALIC, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(fs * .7)
+        cr.set_source_rgba(*col, .85)
+        cr.move_to(tx, y + h * .32 + len(words) * fs * 1.15 + fs * .1)
+        cr.show_text(sub)
+        cr.pop_group_to_source()
+        cr.paint_with_alpha(alpha)
+
+    # ---------- lock screen ----------
+    def lock_image(self, path):
+        W, H = self.W, self.H
+        self.render()
+        out = cairo.ImageSurface(cairo.FORMAT_RGB24, W, H)
+        cr = cairo.Context(out)
+        cr.set_source_surface(self.buf, 0, 0)
+        cr.paint()
+        cr.set_source_rgba(.02, 0, .06, .55)
+        cr.paint()
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        for text, size, y, col in (("SYSTEM LOCKED", H * .075, H * .8, (1, .16, .62)),
+                                   ("type your password to continue", H * .028, H * .86, (0, .92, 1))):
+            cr.set_font_size(size)
+            e = cr.text_extents(text)
+            x = (W - e.x_advance) / 2
+            for lw, a in ((10, .06), (6, .12), (3, .3)):
+                cr.new_path()
+                cr.move_to(x, y)
+                cr.text_path(text)
+                cr.set_source_rgba(*col, a)
+                cr.set_line_width(lw * size / (H * .075))
+                cr.stroke()
+            cr.new_path()
+            cr.move_to(x, y)
+            cr.text_path(text)
+            cr.set_source_rgba(*(min(1, c * .4 + .6) for c in col), 1)
+            cr.fill()
+        out.write_to_png(path)
+
+    def sign_alpha(self, s):
+        t = self.t + s["ph"]
+        if s["mode"] == 0:
+            return .88 + .12 * math.sin(t * 7) * math.sin(t * 2.3)
+        if s["mode"] == 1:
+            k = t % s["per"]
+            if k < .6:
+                return 1.0 if self.r.random() < .45 else .05
+            return 1.0
+        return .55 + .45 * math.sin(t * 1.4)
+
+    def render(self):
+        cr = cairo.Context(self.buf)
+        W, H = self.W, self.H
+        cr.set_source_surface(self.back, 0, 0)
+        cr.paint()
+        self.draw_flicker(cr, "back")
+        self.draw_antennas(cr, "back")
+        self.draw_tower_glow(cr)
+        flash = self.flash()
+        if flash > .01:
+            self.draw_bolt(cr, flash)
+        self.draw_beams(cr)
+        self.draw_cars(cr, False)
+        cr.set_source_surface(self.front, 0, 0)
+        cr.paint()
+        self.draw_flicker(cr, "front")
+        self.draw_antennas(cr, "front")
+        for s in self.signs:
+            cr.set_source_surface(s["surf"], s["x"], s["y"])
+            cr.paint_with_alpha(self.sign_alpha(s))
+        self.draw_holo(cr)
+        if flash > .01:
+            cr.set_source_rgba(.75, .8, 1, .08 * flash)
+            cr.paint()
+        self.draw_cars(cr, True)
+        off = (self.t * 14) % W
+        fy = H - self.fog.get_height() + H * .05
+        for ox in (-off, W - off):
+            cr.set_source_surface(self.fog, ox, fy)
+            cr.paint()
+        cr.set_source_rgba(.65, .75, 1, .22)
+        cr.set_line_width(1)
+        for x, y, ln, _ in self.drops:
+            cr.move_to(x, y)
+            cr.line_to(x - ln * .18, y - ln)
+        cr.stroke()
+        cr.set_source_surface(self.overlay, 0, 0)
+        cr.paint()
+
+    def paint_to(self, cr):
+        r, t = self.r, self.t
+        if t > self.next_glitch:
+            self.glitch_until = t + r.uniform(.12, .35)
+            self.next_glitch = t + r.uniform(7, 16)
+        cr.set_source_surface(self.buf, 0, 0)
+        cr.paint()
+        if t < self.glitch_until:
+            for _ in range(r.randint(3, 7)):
+                y, h = r.uniform(0, self.H), r.uniform(4, 40)
+                cr.save()
+                cr.rectangle(0, y, self.W, h)
+                cr.clip()
+                cr.set_source_surface(self.buf, r.uniform(-30, 30), 0)
+                cr.paint()
+                cr.set_operator(cairo.OPERATOR_ADD)
+                cr.set_source_rgba(*r.choice(((0, .5, .6), (.6, 0, .4))), .25)
+                cr.paint()
+                cr.restore()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fps", type=float, default=24)
+    ap.add_argument("--png")
+    ap.add_argument("--seed", type=int)
+    ap.add_argument("--size")
+    ap.add_argument("--lock-png", help="write lock screen image here")
+    a = ap.parse_args()
+
+    if a.size:
+        W, H = map(int, a.size.split("x"))
+    else:
+        root = Gdk.get_default_root_window()
+        W, H = root.get_width(), root.get_height()
+    city = City(W, H, a.seed)
+
+    if a.png:
+        for _ in range(30):
+            city.step(1 / 24)
+        city.render()
+        out = cairo.ImageSurface(cairo.FORMAT_RGB24, W, H)
+        city.paint_to(cairo.Context(out))
+        out.write_to_png(a.png)
+        if a.lock_png:
+            city.lock_image(a.lock_png)
+        return
+
+    win = Gtk.Window(type=Gtk.WindowType.POPUP)
+    win.set_app_paintable(True)
+    win.set_default_size(W, H)
+    win.move(0, 0)
+    win.set_accept_focus(False)
+    win.add_events(Gdk.EventMask.VISIBILITY_NOTIFY_MASK)
+    state = {"visible": True, "last": GLib.get_monotonic_time(), "battery": False, "n": 0}
+
+    def check_power():
+        import glob
+        online = None
+        for f in glob.glob("/sys/class/power_supply/*/online"):
+            try:
+                online = (online or False) or open(f).read().strip() == "1"
+            except OSError:
+                pass
+        state["battery"] = online is False
+        return True
+
+    def write_lock():
+        import os
+        path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "cyberpunk-lock.png")
+        try:
+            city.lock_image(path + ".tmp")
+            os.replace(path + ".tmp", path)
+        except Exception:
+            pass
+        return False
+
+    def on_draw(_w, cr):
+        now = GLib.get_monotonic_time()
+        dt = min(.1, (now - state["last"]) / 1e6)
+        state["last"] = now
+        city.step(dt)
+        city.render()
+        city.paint_to(cr)
+        return True
+
+    def on_vis(_w, ev):
+        state["visible"] = ev.state != Gdk.VisibilityState.FULLY_OBSCURED
+        state["last"] = GLib.get_monotonic_time()
+        if state["visible"]:
+            win.queue_draw()
+        return False
+
+    def tick():
+        state["n"] += 1
+        if state["battery"] and state["n"] % 2:
+            return True  # half frame rate on battery
+        if state["visible"]:
+            win.queue_draw()
+        return True
+
+    def lower():
+        gw = win.get_window()
+        if gw:
+            gw.lower()
+        return True
+
+    win.connect("draw", on_draw)
+    win.connect("visibility-notify-event", on_vis)
+    win.show_all()
+    win.input_shape_combine_region(cairo.Region())  # clicks pass through to the desktop
+    lower()
+    GLib.timeout_add(max(1, int(1000 / a.fps)), tick)
+    GLib.timeout_add_seconds(3, lower)
+    check_power()
+    GLib.timeout_add_seconds(30, check_power)
+    GLib.timeout_add_seconds(2, write_lock)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, Gtk.main_quit)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, Gtk.main_quit)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

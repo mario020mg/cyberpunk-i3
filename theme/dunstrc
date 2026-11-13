@@ -1,0 +1,23 @@
+# Cyberpunk neon notifications (matches i3 theme)
+[global]
+    font = DejaVu Sans Mono 10
+    frame_width = 2
+    frame_color = "#ff2a9e"
+    separator_color = frame
+    corner_radius = 0
+    offset = 12x40
+    origin = bottom-right
+    padding = 8
+    horizontal_padding = 10
+[urgency_low]
+    background = "#0d0221"
+    foreground = "#6b5b95"
+    frame_color = "#8a2be2"
+[urgency_normal]
+    background = "#0d0221"
+    foreground = "#e6dcff"
+    frame_color = "#00ebff"
+[urgency_critical]
+    background = "#0d0221"
+    foreground = "#ffd138"
+    frame_color = "#ff2a9e"
